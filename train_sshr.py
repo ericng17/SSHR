@@ -174,6 +174,8 @@ def train_phase(args):
     transform_eval = transforms.Compose([transforms.ToTensor()])
 
     train_dataset = Stage1_TrainDataset(data_path=args.trainroot, transform=transform_train, dataset=args.dataset, img_size=args.img_size)
+    # Stable order across Kaggle mounts / archive extraction for epoch resume.
+    train_dataset.object.sort(key=lambda item: os.path.relpath(item[0], args.trainroot))
     data_generator = torch.Generator()
     data_generator.manual_seed(args.seed)
     train_data_loader = DataLoader(
@@ -201,7 +203,9 @@ def train_phase(args):
 
     optimizer = torchutils.PolyOptimizer(optim_params, lr=args.lr, weight_decay=args.wt_dec, max_step=max_step)
     
-    if args.weights[-7:] == '.params':
+    if args.resume:
+        pass  # Full state is restored below after constructing the optimizer.
+    elif args.weights[-7:] == '.params':
         weights_dict = importlib.import_module('network.resnet38d').convert_mxnet_to_torch(args.weights)
         model.load_state_dict(weights_dict, strict=False)
     elif args.weights[-4:] == '.pth':
@@ -213,7 +217,34 @@ def train_phase(args):
     eval_history = []
     os.makedirs(args.save_folder, exist_ok=True)
 
-    for ep in range(args.max_epoches):
+    start_epoch = 0
+    session_start = time.monotonic()
+    if args.resume:
+        # Only load full checkpoints you created/trust (contains Python/NumPy state).
+        state = torch.load(args.resume, map_location='cpu', weights_only=False)
+        recipe = {k: getattr(args, k) for k in (
+            'dataset', 'network', 'seed', 'batch_size', 'img_size', 'n_class',
+            'max_epoches', 'lr', 'wt_dec', 'amp_dtype', 'num_workers',
+            'loss_w_56', 'loss_w_28_1', 'loss_w_28_2', 'loss_w_deep')}
+        if state['recipe'] != recipe or state['dataset_size'] != len(train_dataset):
+            raise ValueError('Resume requires the same training recipe and dataset size.')
+        model.load_state_dict(state['model'])
+        optimizer.load_state_dict(state['optimizer'])
+        optimizer.global_step = state['global_step']
+        scaler.load_state_dict(state['scaler'])
+        start_epoch = state['epoch']
+        random.setstate(state['python_rng'])
+        np.random.set_state(state['numpy_rng'])
+        torch.set_rng_state(state['torch_rng'])
+        torch.cuda.set_rng_state_all(state['cuda_rng'])
+        data_generator.set_state(state['loader_rng'])
+        eval_history = state['eval_history']
+        best_val_miou = state['best_val_miou']
+        print(f'Resuming epoch {start_epoch + 1}; global step {optimizer.global_step}', flush=True)
+
+    if len(train_data_loader) == 0:
+        raise ValueError('No training batches: check trainroot, filename labels and batch size.')
+    for ep in range(start_epoch, args.max_epoches):
         model.train()
         ep_count = ep_EM = ep_acc = 0
         
@@ -294,6 +325,30 @@ def train_phase(args):
             if val_miou is not None and (best_val_miou is None or val_miou > best_val_miou):
                 best_val_miou = val_miou
 
+        if args.save_checkpoints:
+            state = {
+                'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
+                'scaler': scaler.state_dict(), 'epoch': ep + 1,
+                'global_step': optimizer.global_step, 'dataset_size': len(train_dataset),
+                'recipe': {k: getattr(args, k) for k in (
+                    'dataset', 'network', 'seed', 'batch_size', 'img_size', 'n_class',
+                    'max_epoches', 'lr', 'wt_dec', 'amp_dtype', 'num_workers',
+                    'loss_w_56', 'loss_w_28_1', 'loss_w_28_2', 'loss_w_deep')},
+                'python_rng': random.getstate(), 'numpy_rng': np.random.get_state(),
+                'torch_rng': torch.get_rng_state(), 'cuda_rng': torch.cuda.get_rng_state_all(),
+                'loader_rng': data_generator.get_state(), 'eval_history': eval_history,
+                'best_val_miou': best_val_miou,
+            }
+            resume_path = os.path.join(args.save_folder, 'training_resume.pth')
+            torch.save(state, resume_path + '.tmp')
+            os.replace(resume_path + '.tmp', resume_path)
+            print(f'Saved epoch {ep + 1}/{args.max_epoches}: {resume_path}', flush=True)
+        session_epochs = ep + 1 - start_epoch
+        if ((args.session_epochs > 0 and session_epochs >= args.session_epochs)
+                or (args.session_hours > 0 and time.monotonic() - session_start >= args.session_hours * 3600)):
+            print('Session budget reached at epoch boundary. Save outputs for the next session.', flush=True)
+            break
+
     return {'best_val_miou': best_val_miou, 'eval_history': eval_history}
 
 
@@ -349,7 +404,12 @@ if __name__ == '__main__':
     parser.add_argument("--save_checkpoints", "--save-checkpoints", dest="save_checkpoints", action="store_true", default=True)
     parser.add_argument("--no-save_checkpoints", "--no-save-checkpoints", dest="save_checkpoints", action="store_false")
     parser.add_argument("--save_last_k_checkpoints", "--save-last-k-checkpoints", default=5, type=int)
+    parser.add_argument('--resume', default=None, help='Trusted full training_resume.pth checkpoint')
+    parser.add_argument('--session-epochs', type=int, default=0, help='Epochs in this invocation; 0 means unlimited')
+    parser.add_argument('--session-hours', type=float, default=0, help='Soft time budget checked at epoch boundaries')
     args = parser.parse_args()
+    if args.resume and not args.save_checkpoints:
+        parser.error('--resume requires checkpoint saving')
     if args.evaluate_only:
         set_seed(args.seed)
         test_phase(args, dataroot=args.testroot, split_name="test_tta", checkpoint_path=args.weights)
